@@ -191,21 +191,21 @@ configure_mirrors() {
 
 # Function to install prerequisites
 install_prerequisites() {
-    echo "Installing prerequisites..." | tee -a $LOG_FILE
-    show_progress 10 "Installing system prerequisites..."
+    echo "安装先决条件..." | tee -a $LOG_FILE
+    show_progress 10 "安装系统先决条件..."
     
-    # Add rollback step
-    add_rollback_step "$PKG_MANAGER -y remove curl wget yum-utils device-mapper-persistent-data lvm2 ntp chrony 2>/dev/null || true"
+    # 添加回滚步骤
+    add_rollback_step "$PKG_MANAGER -y remove curl wget yum-utils device-mapper-persistent-data lvm2 chrony 2>/dev/null || true"
     
-    # Install necessary packages
-    $PKG_MANAGER -y install curl wget yum-utils device-mapper-persistent-data lvm2 >> $LOG_FILE 2>&1 || error_exit "Failed to install prerequisites"
+    # 安装必要的软件包
+    $PKG_MANAGER -y install curl wget yum-utils device-mapper-persistent-data lvm2 >> $LOG_FILE 2>&1 || error_exit "安装先决条件失败"
     
-    # Install and configure chronyd for time synchronization
-    $PKG_MANAGER -y install ntp chrony >> $LOG_FILE 2>&1 || error_exit "Failed to install time synchronization tools"
+    # 安装并配置 chronyd 进行时间同步 (不再尝试安装 ntp，只安装 chrony)
+    $PKG_MANAGER -y install chrony >> $LOG_FILE 2>&1 || error_exit "安装时间同步工具失败"
     systemctl enable chronyd >> $LOG_FILE 2>&1
     systemctl start chronyd >> $LOG_FILE 2>&1
     
-    echo -e "${GREEN}✓ Prerequisites installed successfully${NC}"
+    echo -e "${GREEN}✓ 先决条件安装成功${NC}"
 }
 
 # Function to configure system settings
