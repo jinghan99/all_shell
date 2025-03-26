@@ -532,10 +532,19 @@ install_network_plugin() {
     elif [ "$CNI_PLUGIN" = "flannel" ]; then
         # 安装 Flannel
         echo "安装 Flannel CNI..." >> $LOG_FILE
-        wget -q https://raw.githubusercontent.com/coreos/flannel/master/Documentation/kube-flannel.yml -O /tmp/kube-flannel.yml
         
-        # 如果需要，替换 CIDR
-        sed -i "s|10.244.0.0/16|$NETWORK_CIDR|g" /tmp/kube-flannel.yml
+        # 使用更可靠的 Flannel 源
+        wget -q https://raw.githubusercontent.com/flannel-io/flannel/master/Documentation/kube-flannel.yml -O /tmp/kube-flannel.yml || \
+        wget -q https://github.com/flannel-io/flannel/releases/latest/download/kube-flannel.yml -O /tmp/kube-flannel.yml || \
+        error_exit "下载 Flannel 清单失败"
+        
+        # 确保 CIDR 设置正确
+        if grep -q "10.244.0.0/16" /tmp/kube-flannel.yml; then
+            echo "替换 Flannel 默认 CIDR 为 $NETWORK_CIDR" >> $LOG_FILE
+            sed -i "s|10.244.0.0/16|$NETWORK_CIDR|g" /tmp/kube-flannel.yml
+        else
+            echo "警告: 未找到默认 CIDR 进行替换，请确认 Flannel 配置" | tee -a $LOG_FILE
+        fi
         
         # 应用 flannel 清单
         kubectl apply -f /tmp/kube-flannel.yml >> $LOG_FILE 2>&1 || error_exit "应用 Flannel 清单失败"
@@ -552,15 +561,51 @@ verify_installation() {
     echo "验证 Kubernetes 安装..." | tee -a $LOG_FILE
     show_progress 10 "验证 Kubernetes 安装..."
     
-    # 等待所有 pod 运行
+    # 等待所有 pod 运行 - 增加等待时间
     echo "等待 pod 就绪..." >> $LOG_FILE
-    sleep 30
+    
+    # 增加等待时间，最多等待 5 分钟
+    echo "等待节点就绪，最多 5 分钟..." | tee -a $LOG_FILE
+    for i in {1..30}; do
+        NODE_STATUS=$(kubectl get nodes | grep 'master\|control-plane' | awk '{print $2}')
+        if [ "$NODE_STATUS" = "Ready" ]; then
+            echo "节点已就绪!" | tee -a $LOG_FILE
+            break
+        fi
+        echo "等待节点就绪，已等待 $((i*10)) 秒..." | tee -a $LOG_FILE
+        sleep 10
+    done
     
     # 检查节点状态
     kubectl get nodes >> $LOG_FILE 2>&1
     NODE_STATUS=$(kubectl get nodes | grep 'master\|control-plane' | awk '{print $2}')
     if [ "$NODE_STATUS" != "Ready" ]; then
-        error_exit "Master 节点未处于 Ready 状态。查看日志获取更多详细信息。"
+        echo -e "${YELLOW}警告: Master 节点未处于 Ready 状态。${NC}" | tee -a $LOG_FILE
+        echo -e "${YELLOW}尝试诊断问题...${NC}" | tee -a $LOG_FILE
+        
+        # 诊断步骤
+        echo "检查 kubelet 状态:" | tee -a $LOG_FILE
+        systemctl status kubelet >> $LOG_FILE 2>&1
+        
+        echo "检查 kubelet 日志:" | tee -a $LOG_FILE
+        journalctl -xeu kubelet --no-pager | tail -n 50 >> $LOG_FILE 2>&1
+        
+        echo "检查 containerd 状态:" | tee -a $LOG_FILE
+        systemctl status containerd >> $LOG_FILE 2>&1
+        
+        echo "检查网络插件 pod 状态:" | tee -a $LOG_FILE
+        kubectl get pods -n kube-system >> $LOG_FILE 2>&1
+        
+        echo "检查所有 pod 状态:" | tee -a $LOG_FILE
+        kubectl get pods --all-namespaces >> $LOG_FILE 2>&1
+        
+        echo -e "${YELLOW}节点未就绪，但安装过程已完成。请查看日志文件 $LOG_FILE 获取详细信息。${NC}" | tee -a $LOG_FILE
+        echo -e "${YELLOW}您可能需要手动检查网络插件配置或重启 kubelet 服务。${NC}" | tee -a $LOG_FILE
+        
+        # 不终止安装，而是继续并提供警告
+        echo -e "${YELLOW}继续安装过程，但请注意节点未处于 Ready 状态。${NC}" | tee -a $LOG_FILE
+    else
+        echo -e "${GREEN}✓ Master 节点已就绪${NC}" | tee -a $LOG_FILE
     fi
     
     # 检查 pod 状态
@@ -574,7 +619,7 @@ verify_installation() {
         echo "警告: 有 $FAILED_PODS 个 pod 处于 Failed 状态。" | tee -a $LOG_FILE
     fi
     
-    echo -e "${GREEN}✓ Kubernetes 安装验证成功${NC}"
+    echo -e "${GREEN}✓ Kubernetes 安装验证完成${NC}"
 }
 
 # 函数：检测可用的网络接口和IP段
@@ -733,6 +778,49 @@ check_system_compatibility() {
     echo -e "${GREEN}✓ 系统兼容性检查完成${NC}"
 }
 
+# 添加一个新函数用于故障排除
+troubleshoot_common_issues() {
+    echo "执行常见问题故障排除..." | tee -a $LOG_FILE
+    show_progress 5 "执行常见问题故障排除..."
+    
+    # 确保 kubelet 服务正在运行
+    echo "确保 kubelet 服务正在运行..." >> $LOG_FILE
+    systemctl restart kubelet
+    systemctl status kubelet >> $LOG_FILE 2>&1
+    
+    # 检查并修复 DNS 配置
+    echo "检查 DNS 配置..." >> $LOG_FILE
+    if [ ! -f /etc/resolv.conf ] || ! grep -q "nameserver" /etc/resolv.conf; then
+        echo "修复 DNS 配置..." >> $LOG_FILE
+        echo "nameserver 8.8.8.8" >> /etc/resolv.conf
+    fi
+    
+    # 检查防火墙规则
+    echo "检查防火墙规则..." >> $LOG_FILE
+    if command -v firewall-cmd &> /dev/null; then
+        echo "确保 Kubernetes 所需端口已开放..." >> $LOG_FILE
+        firewall-cmd --permanent --add-port=6443/tcp >> $LOG_FILE 2>&1 || true
+        firewall-cmd --permanent --add-port=10250/tcp >> $LOG_FILE 2>&1 || true
+        firewall-cmd --permanent --add-port=10251/tcp >> $LOG_FILE 2>&1 || true
+        firewall-cmd --permanent --add-port=10252/tcp >> $LOG_FILE 2>&1 || true
+        firewall-cmd --permanent --add-port=8472/udp >> $LOG_FILE 2>&1 || true
+        firewall-cmd --reload >> $LOG_FILE 2>&1 || true
+    fi
+    
+    # 检查 containerd 配置
+    echo "检查 containerd 配置..." >> $LOG_FILE
+    if [ -f /etc/containerd/config.toml ]; then
+        # 确保 SystemdCgroup 设置为 true
+        if ! grep -q "SystemdCgroup = true" /etc/containerd/config.toml; then
+            echo "修复 containerd 配置..." >> $LOG_FILE
+            sed -i 's/SystemdCgroup = false/SystemdCgroup = true/g' /etc/containerd/config.toml
+            systemctl restart containerd
+        fi
+    fi
+    
+    echo -e "${GREEN}✓ 故障排除完成${NC}"
+}
+
 # 主函数
 main() {
     prompt_for_config
@@ -750,10 +838,27 @@ main() {
     install_kubernetes
     initialize_master
     install_network_plugin
+    
+    # 添加故障排除步骤
+    troubleshoot_common_issues
+    
     verify_installation
     
     # 打印摘要
-    echo -e "\n${GREEN}Kubernetes master 安装成功完成!${NC}"
+    echo -e "\n${GREEN}Kubernetes master 安装过程已完成!${NC}"
+    
+    # 检查节点状态
+    NODE_STATUS=$(kubectl get nodes | grep 'master\|control-plane' | awk '{print $2}')
+    if [ "$NODE_STATUS" != "Ready" ]; then
+        echo -e "\n${YELLOW}警告: Master 节点当前未处于 Ready 状态。${NC}"
+        echo -e "${YELLOW}这可能需要几分钟时间来完成初始化。${NC}"
+        echo -e "${YELLOW}您可以使用以下命令检查状态:${NC}"
+        echo -e "  kubectl get nodes"
+        echo -e "  kubectl get pods --all-namespaces"
+    else
+        echo -e "\n${GREEN}Master 节点已成功就绪!${NC}"
+    fi
+    
     echo -e "\n${YELLOW}=========== 节点加入命令 ===========${NC}"
     echo -e "${GREEN}$JOIN_COMMAND${NC}"
     echo -e "${YELLOW}=========================================${NC}"
